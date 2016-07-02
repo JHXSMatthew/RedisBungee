@@ -27,11 +27,9 @@ import redis.clients.jedis.*;
 import redis.clients.jedis.exceptions.JedisConnectionException;
 
 import java.io.*;
+import java.lang.reflect.Field;
 import java.util.*;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.FutureTask;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 
@@ -61,12 +59,11 @@ public final class RedisBungee extends Plugin {
     private volatile List<String> serverIds;
     private final AtomicInteger nagAboutServers = new AtomicInteger();
     private final AtomicInteger globalPlayerCount = new AtomicInteger();
-    private ScheduledTask integrityCheck;
-    private ScheduledTask heartbeatTask;
+    private Future<?> integrityCheck;
+    private Future<?> heartbeatTask;
     private boolean usingLua;
     private LuaManager.Script serverToPlayersScript;
     private LuaManager.Script getPlayerCountScript;
-    private LuaManager.Script getServerPlayersScript;
 
     private static final Object SERVER_TO_PLAYERS_KEY = new Object();
     private final Cache<Object, Multimap<String, UUID>> serverToPlayersCache = CacheBuilder.newBuilder()
@@ -204,16 +201,6 @@ public final class RedisBungee extends Plugin {
         return setBuilder.build();
     }
 
-    final Set<UUID> getPlayersOnServer(@NonNull String server) {
-        checkArgument(getProxy().getServers().containsKey(server), "server does not exist");
-        Collection<String> asStrings = (Collection<String>) getServerPlayersScript.eval(ImmutableList.<String>of(), ImmutableList.<String>of(server));
-        ImmutableSet.Builder<UUID> builder = ImmutableSet.builder();
-        for (String s : asStrings) {
-            builder.add(UUID.fromString(s));
-        }
-        return builder.build();
-    }
-
     final void sendProxyCommand(@NonNull String proxyId, @NonNull String command) {
         checkArgument(getServerIds().contains(proxyId) || proxyId.equals("allservers"), "proxyId is invalid");
         sendChannelMessage("redisbungee-" + proxyId, command);
@@ -235,6 +222,16 @@ public final class RedisBungee extends Plugin {
 
     @Override
     public void onEnable() {
+        ThreadFactory factory = ((ThreadPoolExecutor) getExecutorService()).getThreadFactory();
+        getExecutorService().shutdownNow();
+        ScheduledExecutorService service;
+        try {
+            Field field = Plugin.class.getDeclaredField("service");
+            field.setAccessible(true);
+            field.set(this, service = Executors.newScheduledThreadPool(24, factory));
+        } catch (Exception e) {
+            throw new RuntimeException("Can't replace BungeeCord thread pool with our own", e);
+        }
         try {
             loadConfig();
         } catch (IOException e) {
@@ -256,7 +253,6 @@ public final class RedisBungee extends Plugin {
                             LuaManager manager = new LuaManager(this);
                             serverToPlayersScript = manager.createScript(IOUtil.readInputStreamAsString(getResourceAsStream("lua/server_to_players.lua")));
                             getPlayerCountScript = manager.createScript(IOUtil.readInputStreamAsString(getResourceAsStream("lua/get_player_count.lua")));
-                            getServerPlayersScript = manager.createScript(IOUtil.readInputStreamAsString(getResourceAsStream("lua/get_server_players.lua")));
                         }
                         break;
                     }
@@ -271,7 +267,7 @@ public final class RedisBungee extends Plugin {
             }
             serverIds = getCurrentServerIds(true, false);
             uuidTranslator = new UUIDTranslator(this);
-            heartbeatTask = getProxy().getScheduler().schedule(this, new Runnable() {
+            heartbeatTask = service.scheduleAtFixedRate(new Runnable() {
                 @Override
                 public void run() {
                     try (Jedis rsc = pool.getResource()) {
@@ -303,7 +299,7 @@ public final class RedisBungee extends Plugin {
             getProxy().getPluginManager().registerListener(this, dataManager);
             psl = new PubSubListener();
             getProxy().getScheduler().runAsync(this, psl);
-            integrityCheck = getProxy().getScheduler().schedule(this, new Runnable() {
+            integrityCheck = service.scheduleAtFixedRate(new Runnable() {
                 @Override
                 public void run() {
                     try (Jedis tmpRsc = pool.getResource()) {
@@ -373,9 +369,8 @@ public final class RedisBungee extends Plugin {
         if (pool != null) {
             // Poison the PubSub listener
             psl.poison();
-            getProxy().getScheduler().cancel(this);
-            integrityCheck.cancel();
-            heartbeatTask.cancel();
+            integrityCheck.cancel(true);
+            heartbeatTask.cancel(true);
             getProxy().getPluginManager().unregisterListeners(this);
 
             try (Jedis tmpRsc = pool.getResource()) {
